@@ -1,0 +1,9 @@
+numpy
+pandas
+polars
+requests
+scipy
+py-vollib
+py-vollib-vectorized
+pytest
+tqdm

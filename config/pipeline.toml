@@ -1,0 +1,24 @@
+[eod]
+symbols = ["SPY"]
+
+# Empty from_date means: start after the max date already present in the final file.
+from_date = "20230601"
+
+# Empty end_date means: previous business day.
+end_date = ""
+
+# Supported values: daily, weekly, monthly, yearly, all.
+# Each requested range is merged into the final parquet immediately.
+# Keep daily for full-chain SPY EOD; larger ranges can be very memory-heavy.
+batch_mode = "weekly"
+
+# Optional filters. Uncomment only when you intentionally want a smaller chain.
+# max_dte = 90
+# strike_range = 50
+
+[m1]
+symbols = ["SPY"]
+
+# Empty values mean: use every date present in the selected local option M1 parquet files.
+from_date = ""
+end_date = ""
