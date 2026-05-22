@@ -3,14 +3,14 @@
 Проект забирает данные из локального Theta Terminal v3 и готовит датасеты для тестирования стратегий. Текущий рабочий контур:
 
 - `SPY` EOD: докачка недостающих дат, расчёт IV/греков, merge в финальный parquet.
-- `SPY` M1: обогащение уже скачанных локальных option M1 parquet греческими метриками.
-- Live-download M1 через Theta будет добавлен отдельным шагом после покупки подписки.
+- `SPY` M1: докачка stock OHLC 1m и option quote 1m, затем локальный расчёт IV/греков.
+- Tick data будет отдельным этапом после стабилизации M1.
 
 ## Быстрый запуск
 
 1. Запустить `ThetaTerminalv3.jar`.
 2. Проверить `.env`: особенно `THETA_TIINGO_USA_ROOT`, `THETA_RISK_FREE_RATES_PATH`, M1-директории.
-3. Настроить тикеры и даты в `config/pipeline.toml`.
+3. Настроить тикеры, даты и concurrency в `config/pipeline.toml`.
 
 EOD dry-run:
 
@@ -24,28 +24,34 @@ EOD update:
 .\.venv\Scripts\python.exe main.py eod update
 ```
 
-M1 dry-run по локальным option M1 файлам:
+M1 update dry-run: скачать недостающие raw M1 и обогатить греками:
 
 ```powershell
-.\.venv\Scripts\python.exe main.py m1 enrich --dry-run
+.\.venv\Scripts\python.exe main.py m1 update --dry-run
 ```
 
-M1 enrichment:
+M1 update:
 
 ```powershell
-.\.venv\Scripts\python.exe main.py m1 enrich
+.\.venv\Scripts\python.exe main.py m1 update
 ```
 
-Принудительный пересчёт уже существующих M1 with-greeks файлов:
+Smoke-check на один день:
+
+```powershell
+.\.venv\Scripts\python.exe main.py m1 update --max-days 1 --overwrite-greeks
+```
+
+Только скачать raw M1 без расчёта греков:
+
+```powershell
+.\.venv\Scripts\python.exe main.py m1 download
+```
+
+Только пересчитать греки по уже локальным option M1 parquet:
 
 ```powershell
 .\.venv\Scripts\python.exe main.py m1 enrich --overwrite
-```
-
-Ограниченный smoke-check по одной дате:
-
-```powershell
-.\.venv\Scripts\python.exe main.py m1 enrich --from-date 20200103 --end-date 20200103 --overwrite
 ```
 
 Ручное обновление локального DGS1:
@@ -53,6 +59,25 @@ M1 enrichment:
 ```powershell
 .\.venv\Scripts\python.exe main.py rates update
 ```
+
+## Concurrency
+
+Для M1 можно выбирать число concurrent requests: `1`, `2`, `4`, `8`.
+
+```powershell
+.\.venv\Scripts\python.exe main.py m1 update --stock-concurrency 2 --option-concurrency 4
+```
+
+Текущие значения в `config/pipeline.toml`:
+
+```toml
+[m1]
+stock_concurrency = 2
+option_concurrency = 4
+option_expiration_mode = "same_day"
+```
+
+`same_day` означает 0DTE: `expiration = quote date`. Это соответствует текущим raw M1 файлам SPY. Режим `all` запрашивает `expiration=*` и может быть на порядки тяжелее.
 
 ## Python runners
 
@@ -62,7 +87,8 @@ M1 enrichment:
 .\.venv\Scripts\python.exe src\thetadata_pipeline\runners\eod.py --dry-run
 .\.venv\Scripts\python.exe src\thetadata_pipeline\runners\eod.py
 .\.venv\Scripts\python.exe src\thetadata_pipeline\runners\m1.py --dry-run
-.\.venv\Scripts\python.exe src\thetadata_pipeline\runners\m1.py --overwrite
+.\.venv\Scripts\python.exe src\thetadata_pipeline\runners\m1.py --max-days 1
+.\.venv\Scripts\python.exe src\thetadata_pipeline\runners\m1.py --mode enrich --overwrite
 ```
 
 ## Данные
@@ -79,7 +105,7 @@ Raw option M1 файлы:
 data/options/m1/*_SPY_m1_opts.parquet
 ```
 
-Stock M1 файл для базовой цены:
+Stock M1 файлы для базовой цены:
 
 ```text
 data/stocks/m1/*SPY*.parquet
@@ -98,6 +124,7 @@ data/options/m1/with_greeks/*_SPY_m1_greeks_opts.parquet
 DGS1 хранится в `data/reference_rates/DGS1.parquet`. Если для нужного диапазона нет локальной ставки и её не удалось обновить из FRED, запуск падает. Дефолтная risk-free ставка в расчётном пути не используется.
 
 Для M1 `baseClose` берётся из локального stock M1 файла по ключу `date + ms_of_day`, а не из дневного close.
+Если точной stock-минуты нет, M1 enrichment перекачивает stock M1 за этот день и повторяет exact join. Подстановка предыдущей минуты не используется.
 
 ## M1 схема
 

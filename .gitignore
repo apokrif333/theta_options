@@ -5,11 +5,13 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.virtual_documents/
 
 .env
-Delete.ipynb
 data/
 ThetaTerminal/
 
 *.tmp
 *.tmp.parquet
+**/.ipynb_checkpoints/
+/notebooks/lattency.ipynb

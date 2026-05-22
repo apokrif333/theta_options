@@ -66,6 +66,10 @@ class Settings:
         os.getenv("THETA_M1_WITH_GREEKS_DIR", "data/options/m1/with_greeks")
     )
     stock_m1_dir: Path = _resolve_project_path(os.getenv("THETA_STOCK_M1_DIR", "data/stocks/m1"))
+    stock_eod_dir: Path = _resolve_project_path(os.getenv("THETA_STOCK_EOD_DIR", "data/stocks/eod"))
+    stock_ticks_dir: Path = _resolve_project_path(os.getenv("THETA_STOCK_TICKS_DIR", "data/stocks/ticks"))
+    ib_states_dir: Path = _resolve_project_path(os.getenv("IB_STATES_DIR", "data/ib"))
+
 
     def eod_final_path(self, symbol: str | None = None) -> Path:
         resolved_symbol = (symbol or self.default_symbol).upper()
