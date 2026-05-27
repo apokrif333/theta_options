@@ -8,12 +8,9 @@ import pandas as pd
 import polars as pl
 
 from ..loaders.m1 import download_stock_m1_data
-from ..loaders.tick import (
-    StockTickWindow,
-    ensure_stock_tick_windows,
-)
+from ..loaders.tick import ensure_stock_tick_windows
 from ..settings import Settings
-from ..time_utils import format_time_ms, ms_of_day, parse_ib_expiration, time_to_ms_expr, to_date
+from ..time_utils import format_time_ms, ms_of_day, parse_ib_expiration, time_to_ms_expr
 
 
 OPEN_MS = 34_560_000
@@ -257,15 +254,12 @@ def _resolve_tick_triggers(
     crossed: pd.DataFrame,
     tick_concurrency: int,
 ) -> pd.DataFrame:
-    windows = [
-        StockTickWindow(
-            ticker=ticker,
-            day=to_date(row["trade_date"]),
-            start_ms=int(row["ms_of_day"]),
-            end_ms=int(row["ms_of_day"]) + TICK_LOOKAHEAD_MS,
-        )
-        for _, row in crossed.iterrows()
-    ]
+    windows = crossed.reset_index()[["trade_date", "ms_of_day"]].copy()
+    windows["ticker"] = ticker
+    windows["date"] = windows["trade_date"]
+    windows["start_ms"] = windows["ms_of_day"].astype(int)
+    windows["end_ms"] = windows["start_ms"] + TICK_LOOKAHEAD_MS
+    windows = windows[["ticker", "date", "start_ms", "end_ms"]]
     tick_concurrency = max(1, int(tick_concurrency))
     print(f"{ticker}. Tick trigger jobs={len(crossed)}, concurrency={tick_concurrency}")
 

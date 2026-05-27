@@ -53,7 +53,6 @@ OPTION_QUOTE_COLUMNS = [
     "ask_condition",
 ]
 
-
 def fetch_stock_quote_window(
     settings: Settings,
     symbol: str,
@@ -138,48 +137,87 @@ def ensure_option_quote_window(
     start_ms: int,
     end_ms: int,
     interval: str = "100ms",
+    option_concurrency: int = 1,
 ) -> pl.DataFrame:
-    window = OptionQuoteWindow(
-        ticker=symbol.upper(),
-        day=coerce_date(day),
-        expiration=coerce_date(expiration),
-        strike=normalize_option_strike(strike),
-        right=_option_right_code(right),
-        start_ms=int(start_ms),
-        end_ms=int(end_ms),
-    )
-    missing = missing_option_quote_ranges(settings, window, interval=interval)
-    print(
-        f"{window.ticker}. Option quotes {interval}: {window.day} "
-        f"{window.expiration} {window.strike:g}{window.right} "
-        f"{window.start_ms}..{window.end_ms}; theta_ranges={len(missing)}"
-    )
-    print(f"{window.ticker}. Option quotes cache: {option_quote_file_path(settings, window.ticker, interval=interval)}")
-    if missing:
-        staged_paths: list[Path] = []
-        covered_ranges: list[tuple[dt.date, dt.date, float, str, int, int]] = []
-        for start, end in missing:
-            print(f"{window.ticker}. Option quotes downloading {interval} {window.day} {start}..{end}")
-            quotes = fetch_option_quote_window(
-                settings=settings,
-                symbol=window.ticker,
-                day=window.day,
-                expiration=window.expiration,
-                strike=window.strike,
-                right=window.right,
-                start_ms=start,
-                end_ms=end,
-                interval=interval,
+    return ensure_option_quote_windows(
+        settings=settings,
+        windows=[
+            OptionQuoteWindow(
+                ticker=symbol.upper(),
+                day=coerce_date(day),
+                expiration=coerce_date(expiration),
+                strike=normalize_option_strike(strike),
+                right=_option_right_code(right),
+                start_ms=int(start_ms),
+                end_ms=int(end_ms),
             )
-            if not quotes.is_empty():
-                staged_paths.append(stage_option_quote_frame(settings, window, quotes, interval=interval))
-            covered_ranges.append((window.day, window.expiration, window.strike, window.right, start, end))
-            print(f"{window.ticker}. Option quotes rows={quotes.height}")
-        if staged_paths:
-            print(f"{window.ticker}. Option quotes cache merge: staged_files={len(staged_paths)}")
-            merge_option_quote_file(settings, window.ticker, staged_paths, interval=interval)
-        record_option_quote_coverage(settings, window.ticker, covered_ranges, interval=interval)
-    return load_option_quote_window(settings, window, interval=interval)
+        ],
+        interval=interval,
+        option_concurrency=option_concurrency,
+    )
+
+
+def ensure_option_quote_windows(
+    settings: Settings,
+    windows,
+    interval: str = "100ms",
+    option_concurrency: int = 1,
+) -> pl.DataFrame:
+    """ Ensure option quote data is available for the specified windows and return the combined data.
+
+    Downloads missing option quote data from Theta Data API and caches it locally.
+    Returns the option quotes for all requested windows from the local cache.
+
+    Args:
+        settings:
+        windows: Option quote windows to ensure. Can be:
+            - Single OptionQuoteWindow instance
+            - List/tuple of OptionQuoteWindow instances
+            - pl.DataFrame with required columns
+            - Dict with required keys
+            - pandas DataFrame (via to_dict('records'))
+
+            Required columns/keys for dict-like inputs:
+            - ticker (str):
+            - date (date/str): YYYY-MM-DD or YYYYMMDD
+            - expiration (date/str): YYYY-MM-DD or YYYYMMDD
+            - strike (float):
+            - right (str): 'C'/'call' or 'P'/'put'
+            - start_ms (int):
+            - end_ms (int):
+
+        interval: (e.g., '100ms', '1s', 'tick')
+        option_concurrency:
+
+    Returns:
+        pl.DataFrame
+    """
+    normalized = _coerce_option_quote_windows(windows)
+    if not normalized:
+        return _empty_option_quote_frame()
+
+    jobs: list[tuple[OptionQuoteWindow, int, int]] = []
+    for window in normalized:
+        missing = missing_option_quote_ranges(settings, window, interval=interval)
+        jobs.extend((window, start, end) for start, end in missing)
+
+    tickers = sorted({window.ticker for window in normalized})
+    print(
+        f"Option quotes {interval}: windows={len(normalized)}, "
+        f"theta_ranges={len(jobs)}, concurrency={max(1, int(option_concurrency))}, "
+        f"tickers={','.join(tickers)}"
+    )
+    for ticker in tickers:
+        print(f"{ticker}. Option quotes cache: {option_quote_file_path(settings, ticker, interval=interval)}")
+
+    if jobs:
+        _download_and_store_option_quote_jobs(
+            settings=settings,
+            jobs=jobs,
+            interval=interval,
+            option_concurrency=option_concurrency,
+        )
+    return load_option_quote_windows(settings, normalized, interval=interval)
 
 
 def load_option_quote_window(
@@ -214,6 +252,26 @@ def load_option_quote_window(
     )
 
 
+def load_option_quote_windows(
+    settings: Settings,
+    windows,
+    interval: str = "100ms",
+) -> pl.DataFrame:
+    windows = _coerce_option_quote_windows(windows)
+    frames: list[pl.DataFrame] = []
+    for window in windows:
+        frame = load_option_quote_window(settings, window, interval=interval)
+        if not frame.is_empty():
+            frames.append(frame)
+    if not frames:
+        return _empty_option_quote_frame()
+    return (
+        pl.concat(frames)
+        .sort(["ticker", "date", "expiration", "strike", "right", "time"])
+        .unique(subset=["ticker", "date", "expiration", "strike", "right", "time"], keep="last", maintain_order=True)
+    )
+
+
 def missing_option_quote_ranges(
     settings: Settings,
     window: OptionQuoteWindow,
@@ -234,6 +292,81 @@ def missing_option_quote_ranges(
         .to_dicts()
     )
     return _subtract_covered_ranges(window.start_ms, window.end_ms, [(row["start_ms"], row["end_ms"]) for row in rows])
+
+
+def _coerce_option_quote_windows(windows) -> list[OptionQuoteWindow]:
+    if isinstance(windows, OptionQuoteWindow):
+        raw_windows = [windows]
+    elif isinstance(windows, pl.DataFrame):
+        raw_windows = windows.to_dicts()
+    elif isinstance(windows, dict):
+        raw_windows = [windows]
+    elif hasattr(windows, "to_dict") and not isinstance(windows, list | tuple):
+        raw_windows = windows.to_dict("records")
+    else:
+        raw_windows = list(windows)
+
+    normalized: list[OptionQuoteWindow] = []
+    for raw in raw_windows:
+        window = _normalize_option_quote_window(raw)
+        if window.start_ms <= window.end_ms:
+            normalized.append(window)
+    return normalized
+
+
+def _normalize_option_quote_window(window) -> OptionQuoteWindow:
+    if isinstance(window, OptionQuoteWindow):
+        return _normalize_option_quote_window_values(
+            ticker=window.ticker,
+            day=window.day,
+            expiration=window.expiration,
+            strike=window.strike,
+            right=window.right,
+            start_ms=window.start_ms,
+            end_ms=window.end_ms,
+        )
+    if isinstance(window, dict):
+        return _option_quote_window_from_mapping(window)
+    raise TypeError(f"Unsupported option quote window row type: {type(window).__name__}")
+
+
+def _option_quote_window_from_mapping(row: dict) -> OptionQuoteWindow:
+    required = ["ticker", "date", "expiration", "strike", "right", "start_ms", "end_ms"]
+    missing = [column for column in required if column not in row or row[column] is None]
+    if missing:
+        raise KeyError(
+            "Option quote windows require fixed columns: "
+            f"{', '.join(required)}. Missing: {', '.join(missing)}"
+        )
+    return _normalize_option_quote_window_values(
+        ticker=row["ticker"],
+        day=row["date"],
+        expiration=row["expiration"],
+        strike=row["strike"],
+        right=row["right"],
+        start_ms=row["start_ms"],
+        end_ms=row["end_ms"],
+    )
+
+
+def _normalize_option_quote_window_values(
+    ticker,
+    day,
+    expiration,
+    strike,
+    right,
+    start_ms,
+    end_ms,
+) -> OptionQuoteWindow:
+    return OptionQuoteWindow(
+        ticker=str(ticker).upper(),
+        day=coerce_date(day),
+        expiration=coerce_date(expiration),
+        strike=normalize_option_strike(strike),
+        right=_option_right_code(right),
+        start_ms=int(start_ms),
+        end_ms=int(end_ms),
+    )
 
 
 def load_stock_tick_window(
@@ -303,23 +436,21 @@ def ensure_stock_tick_window(
 
 def ensure_stock_tick_windows(
     settings: Settings,
-    windows: list[StockTickWindow],
+    windows,
     concurrency: int = 1,
     interval: str = "tick",
 ) -> pl.DataFrame:
-    if not windows:
-        return pl.DataFrame(schema={"date": pl.Date, "time": pl.Time, "bid": pl.Float64, "ask": pl.Float64})
+    """Ensure stock tick data is available for the specified windows and return the combined data.
 
-    normalized = [
-        StockTickWindow(
-            ticker=window.ticker.upper(),
-            day=window.day,
-            start_ms=int(window.start_ms),
-            end_ms=int(window.end_ms),
-        )
-        for window in windows
-        if int(window.start_ms) <= int(window.end_ms)
-    ]
+    Downloads missing stock quote ticks from Theta Data API and caches them locally.
+    `windows` accepts the same input shapes as option quote windows: a single
+    StockTickWindow, an iterable of windows, a mapping, a Polars DataFrame, or
+    a pandas-like DataFrame with ticker/date/start_ms/end_ms columns.
+    """
+    normalized = _coerce_stock_tick_windows(windows)
+    if not normalized:
+        return _empty_stock_tick_frame()
+
     requested = _merge_stock_tick_windows(normalized)
     missing = _missing_stock_tick_windows(settings, requested)
     print(f"Stock ticks. requested_ranges={len(requested)}, theta_ranges={len(missing)}")
@@ -333,18 +464,88 @@ def ensure_stock_tick_windows(
     return load_stock_tick_windows(settings, requested)
 
 
-def load_stock_tick_windows(settings: Settings, windows: list[StockTickWindow]) -> pl.DataFrame:
+def load_stock_tick_windows(settings: Settings, windows) -> pl.DataFrame:
+    windows = _coerce_stock_tick_windows(windows)
     frames: list[pl.DataFrame] = []
     for window in windows:
         ticks = load_stock_tick_window(settings, window.ticker, window.day, window.start_ms, window.end_ms)
         if ticks is not None and not ticks.is_empty():
             frames.append(ticks.select(["date", "time", "bid", "ask"]))
     if not frames:
-        return pl.DataFrame(schema={"date": pl.Date, "time": pl.Time, "bid": pl.Float64, "ask": pl.Float64})
+        return _empty_stock_tick_frame()
     return (
         pl.concat(frames)
         .sort(["date", "time"])
         .unique(subset=["date", "bid", "ask"], keep="first", maintain_order=True)
+    )
+
+
+def _coerce_stock_tick_windows(windows) -> list[StockTickWindow]:
+    if isinstance(windows, StockTickWindow):
+        raw_windows = [windows]
+    elif isinstance(windows, pl.DataFrame):
+        raw_windows = windows.to_dicts()
+    elif isinstance(windows, dict):
+        raw_windows = [windows]
+    elif hasattr(windows, "to_dict") and not isinstance(windows, list | tuple):
+        raw_windows = windows.to_dict("records")
+    else:
+        raw_windows = list(windows)
+
+    normalized: list[StockTickWindow] = []
+    for raw in raw_windows:
+        window = _normalize_stock_tick_window(raw)
+        if window.start_ms <= window.end_ms:
+            normalized.append(window)
+    return normalized
+
+
+def _normalize_stock_tick_window(window) -> StockTickWindow:
+    if isinstance(window, StockTickWindow):
+        return _normalize_stock_tick_window_values(
+            ticker=window.ticker,
+            day=window.day,
+            start_ms=window.start_ms,
+            end_ms=window.end_ms,
+        )
+    if isinstance(window, dict):
+        return _stock_tick_window_from_mapping(window)
+    raise TypeError(f"Unsupported stock tick window row type: {type(window).__name__}")
+
+
+def _stock_tick_window_from_mapping(row: dict) -> StockTickWindow:
+    required = ["ticker", "date", "start_ms", "end_ms"]
+    values = {
+        "ticker": row.get("ticker"),
+        "date": row.get("date") if row.get("date") is not None else row.get("day"),
+        "start_ms": row.get("start_ms"),
+        "end_ms": row.get("end_ms"),
+    }
+    missing = [column for column in required if values[column] is None]
+    if missing:
+        raise KeyError(
+            "Stock tick windows require fixed columns: "
+            f"{', '.join(required)}. Missing: {', '.join(missing)}"
+        )
+    return _normalize_stock_tick_window_values(
+        ticker=values["ticker"],
+        day=values["date"],
+        start_ms=values["start_ms"],
+        end_ms=values["end_ms"],
+    )
+
+
+def _normalize_stock_tick_window_values(
+    ticker,
+    day,
+    start_ms,
+    end_ms,
+) -> StockTickWindow:
+    return StockTickWindow(
+        ticker=str(ticker).upper(),
+        day=coerce_date(day),
+        start_ms=int(start_ms),
+        end_ms=int(end_ms),
     )
 
 
@@ -497,6 +698,60 @@ def record_option_quote_coverage(
     frame.write_parquet(tmp_path)
     tmp_path.replace(path)
     return path
+
+
+def _download_and_store_option_quote_jobs(
+    settings: Settings,
+    jobs: list[tuple[OptionQuoteWindow, int, int]],
+    interval: str,
+    option_concurrency: int,
+) -> None:
+    staged_by_ticker: dict[str, list[Path]] = {}
+    covered_by_ticker: dict[str, list[tuple[dt.date, dt.date, float, str, int, int]]] = {}
+    concurrency = max(1, int(option_concurrency))
+    print(f"Option quotes downloading ranges={len(jobs)}, concurrency={concurrency}")
+
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = {
+            executor.submit(
+                fetch_option_quote_window,
+                settings,
+                window.ticker,
+                window.day,
+                window.expiration,
+                window.strike,
+                window.right,
+                start,
+                end,
+                interval,
+            ): (window, start, end)
+            for window, start, end in jobs
+        }
+        with tqdm(total=len(futures), desc="Option quotes download", unit="range") as pbar:
+            for future in as_completed(futures):
+                window, start, end = futures[future]
+                quotes = future.result()
+                if not quotes.is_empty():
+                    staged_by_ticker.setdefault(window.ticker, []).append(
+                        stage_option_quote_frame(settings, window, quotes, interval=interval)
+                    )
+                covered_by_ticker.setdefault(window.ticker, []).append(
+                    (window.day, window.expiration, window.strike, window.right, start, end)
+                )
+                pbar.update(1)
+                pbar.set_postfix(
+                    ticker=window.ticker,
+                    date=str(window.day),
+                    start=str(start),
+                    end=str(end),
+                    rows=quotes.height,
+                )
+
+    for ticker, staged_paths in staged_by_ticker.items():
+        print(f"{ticker}. Option quotes cache merge: staged_files={len(staged_paths)}")
+        merge_option_quote_file(settings, ticker, staged_paths, interval=interval)
+    for ticker, ranges in covered_by_ticker.items():
+        record_option_quote_coverage(settings, ticker, ranges, interval=interval)
 
 
 def _download_and_store_stock_tick_windows(
@@ -936,6 +1191,10 @@ def _scan_option_quote_file(path: Path) -> pl.LazyFrame:
         .sort(["date", "expiration", "strike", "right", "time"])
         .unique(subset=["date", "expiration", "strike", "right", "time"], keep="last", maintain_order=True)
     )
+
+
+def _empty_stock_tick_frame() -> pl.DataFrame:
+    return pl.DataFrame(schema={"date": pl.Date, "time": pl.Time, "bid": pl.Float64, "ask": pl.Float64})
 
 
 def _empty_option_quote_frame() -> pl.DataFrame:

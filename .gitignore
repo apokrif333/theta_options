@@ -14,4 +14,4 @@ ThetaTerminal/
 *.tmp
 *.tmp.parquet
 **/.ipynb_checkpoints/
-/notebooks/lattency.ipynb
+/notebooks/legacy/

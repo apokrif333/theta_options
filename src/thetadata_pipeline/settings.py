@@ -69,7 +69,7 @@ class Settings:
     stock_eod_dir: Path = _resolve_project_path(os.getenv("THETA_STOCK_EOD_DIR", "data/stocks/eod"))
     stock_ticks_dir: Path = _resolve_project_path(os.getenv("THETA_STOCK_TICKS_DIR", "data/stocks/ticks"))
     ib_states_dir: Path = _resolve_project_path(os.getenv("IB_STATES_DIR", "data/ib"))
-
+    strategies_dir: Path = _resolve_project_path(os.getenv("THETA_STRATEGIES_DIR", "data/strategies"))
 
     def eod_final_path(self, symbol: str | None = None) -> Path:
         resolved_symbol = (symbol or self.default_symbol).upper()
@@ -81,6 +81,13 @@ class Settings:
             return (self.data_dir / DEFAULT_SPY_EOD_FINAL_PATH).resolve()
 
         return (self.data_dir / "options" / "EOD" / "with_greeks" / f"{resolved_symbol}_etf_greeks.parquet").resolve()
+
+    def strategy_strangle_trades_path(self, symbol: str | None = None) -> Path:
+        resolved_symbol = (symbol or self.default_symbol).upper()
+        override = os.getenv(f"THETA_{resolved_symbol}_STRANGLE_TRADES_PATH")
+        if override:
+            return _resolve_project_path(override)
+        return (self.strategies_dir / f"{resolved_symbol}_strangle_trades.parquet").resolve()
 
     @property
     def staging_eod_dir(self) -> Path:

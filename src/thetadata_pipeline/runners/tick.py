@@ -26,6 +26,7 @@ def run(
     start_ms: int | None = None,
     end_ms: int | None = None,
     interval: str | None = None,
+    option_concurrency: int | None = None,
     dry_run: bool = False,
 ) -> int:
     settings = get_settings()
@@ -37,6 +38,7 @@ def run(
     effective_start_ms = start_ms if start_ms is not None else tick.start_ms
     effective_end_ms = end_ms if end_ms is not None else tick.end_ms
     effective_interval = interval or tick.interval
+    effective_option_concurrency = option_concurrency or cfg.m1.option_concurrency
 
     for symbol in tick.symbols or [settings.default_symbol]:
         if dry_run:
@@ -47,6 +49,7 @@ def run(
                 start_ms=effective_start_ms,
                 end_ms=effective_end_ms,
                 interval=effective_interval,
+                option_concurrency=effective_option_concurrency,
                 expiration=tick.expiration,
                 strike=tick.strike,
                 right=tick.right,
@@ -93,6 +96,7 @@ def run(
                 start_ms=effective_start_ms,
                 end_ms=effective_end_ms,
                 interval=effective_interval,
+                option_concurrency=effective_option_concurrency,
             )
             _print_frame(frame, symbol, effective_mode)
             continue
@@ -109,6 +113,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-ms", type=int, default=None)
     parser.add_argument("--end-ms", type=int, default=None)
     parser.add_argument("--interval", default=None)
+    parser.add_argument("--option-concurrency", type=int, choices=[1, 2, 4, 8], default=None)
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -137,6 +142,7 @@ def _print_plan(
     start_ms: int,
     end_ms: int,
     interval: str,
+    option_concurrency: int,
     expiration: str | None,
     strike: float | None,
     right: str | None,
@@ -148,6 +154,7 @@ def _print_plan(
     print(f"start_ms={start_ms}")
     print(f"end_ms={end_ms}")
     print(f"interval={interval}")
+    print(f"option_concurrency={option_concurrency}")
     if mode == "option_quote":
         print(f"expiration={expiration}")
         print(f"strike={strike}")
@@ -163,6 +170,7 @@ if __name__ == "__main__":
             start_ms=args.start_ms,
             end_ms=args.end_ms,
             interval=args.interval,
+            option_concurrency=args.option_concurrency,
             dry_run=args.dry_run,
         )
     )

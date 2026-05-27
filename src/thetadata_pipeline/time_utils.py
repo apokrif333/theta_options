@@ -36,8 +36,16 @@ def datetime_to_ms_expr(column: str | pl.Expr) -> pl.Expr:
     return time_to_ms_expr(column)
 
 
-def ms_of_day(value: pd.Timestamp | dt.datetime | dt.time) -> int:
-    return value.hour * 3_600_000 + value.minute * 60_000 + value.second * 1_000 + value.microsecond // 1_000
+def ms_of_day(value: pl.Series | pd.Timestamp | dt.datetime | dt.time) -> int | pl.Series:
+    if isinstance(value, pl.Series):
+        hour = value.dt.hour().cast(pl.Int64) * 3_600_000
+        minute = value.dt.minute().cast(pl.Int64) * 60_000
+        second = value.dt.second().cast(pl.Int64) * 1_000
+        micro = value.dt.microsecond().cast(pl.Int64) // 1_000
+        answ = hour + minute + second + micro
+    else:
+        answ = value.hour * 3_600_000 + value.minute * 60_000 + value.second * 1_000 + value.microsecond // 1_000
+    return answ
 
 
 def format_time_ms(ms: int) -> str:

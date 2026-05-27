@@ -101,6 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
     tick_run_parser.add_argument("--start-ms", type=int, default=None)
     tick_run_parser.add_argument("--end-ms", type=int, default=None)
     tick_run_parser.add_argument("--interval", default=None)
+    tick_run_parser.add_argument("--option-concurrency", type=int, choices=[1, 2, 4, 8], default=None)
     tick_run_parser.add_argument("--dry-run", action="store_true")
     tick_run_parser.set_defaults(func=_run_tick_config)
 
@@ -119,6 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
     option_quote_parser.add_argument("--strike", type=float, required=True, help="Option strike in dollars or raw strike*1000")
     option_quote_parser.add_argument("--right", required=True, choices=["c", "p", "call", "put", "C", "P", "CALL", "PUT"])
     option_quote_parser.add_argument("--interval", default="100ms", help="Theta interval: tick, 10ms, 100ms, 1s, ...")
+    option_quote_parser.add_argument("--option-concurrency", type=int, choices=[1, 2, 4, 8], default=None)
     option_quote_parser.set_defaults(func=_run_tick_option_quote)
 
     lattency_parser = subparsers.add_parser("lattency", help="IB trades lattency analysis")
@@ -426,6 +428,7 @@ def _run_tick_config(args: argparse.Namespace) -> int:
         start_ms=args.start_ms,
         end_ms=args.end_ms,
         interval=args.interval,
+        option_concurrency=args.option_concurrency,
         dry_run=args.dry_run,
     )
 
@@ -452,6 +455,7 @@ def _run_tick_stock_quote(args: argparse.Namespace) -> int:
         day=day,
         start_ms=args.start_ms,
         end_ms=args.end_ms,
+        interval=args.interval,
     )
     _print_tick_frame(frame, "stock_quote")
     if args.interval.lower() == "tick":
@@ -476,6 +480,7 @@ def _run_tick_stock_trade(args: argparse.Namespace) -> int:
 
 def _run_tick_option_quote(args: argparse.Namespace) -> int:
     settings = get_settings()
+    config = load_pipeline_config(args.config)
     day = _required_date(args.date, "date")
     expiration = _required_date(args.expiration, "expiration")
     frame = ensure_option_quote_window(
@@ -488,6 +493,7 @@ def _run_tick_option_quote(args: argparse.Namespace) -> int:
         start_ms=args.start_ms,
         end_ms=args.end_ms,
         interval=args.interval,
+        option_concurrency=args.option_concurrency or config.m1.option_concurrency,
     )
     _print_tick_frame(frame, "option_quote")
     return 0
