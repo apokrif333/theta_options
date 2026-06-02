@@ -67,7 +67,12 @@ class Settings:
     )
     stock_m1_dir: Path = _resolve_project_path(os.getenv("THETA_STOCK_M1_DIR", "data/stocks/m1"))
     stock_eod_dir: Path = _resolve_project_path(os.getenv("THETA_STOCK_EOD_DIR", "data/stocks/eod"))
-    stock_ticks_dir: Path = _resolve_project_path(os.getenv("THETA_STOCK_TICKS_DIR", "data/stocks/ticks"))
+    stock_ticks_quotes_dir: Path = _resolve_project_path(
+        os.getenv("THETA_STOCK_TICKS_QUOTES_DIR", os.getenv("THETA_STOCK_TICKS_DIR", "data/stocks/ticks_quotes"))
+    )
+    stock_ticks_trades_dir: Path = _resolve_project_path(
+        os.getenv("THETA_STOCK_TICKS_TRADES_DIR", "data/stocks/ticks_trades")
+    )
     ib_states_dir: Path = _resolve_project_path(os.getenv("IB_STATES_DIR", "data/ib"))
     strategies_dir: Path = _resolve_project_path(os.getenv("THETA_STRATEGIES_DIR", "data/strategies"))
 
@@ -88,6 +93,10 @@ class Settings:
         if override:
             return _resolve_project_path(override)
         return (self.strategies_dir / f"{resolved_symbol}_strangle_trades.parquet").resolve()
+
+    @property
+    def stock_ticks_dir(self) -> Path:
+        return self.stock_ticks_quotes_dir
 
     @property
     def staging_eod_dir(self) -> Path:

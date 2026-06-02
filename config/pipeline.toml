@@ -1,11 +1,30 @@
 [analysis]
 account_id = 'U1717377'
 
+[strategy]
+ticker = "SPY"
+date_cut = "20160101"
+need_time = 9.6
+cut_delta_up = 0.40
+cut_delta_down = 0.10
+need_delta = 0.35
+
+latency_max_seconds = 120.0
+
+option_concurrency = 8
+tick_concurrency = 8
+stop_window_ms = 300000
+fallback_exit_option_price = 0.02
+
+# Supported values: quotes, trades.
+stock_tick_source = "trades"
+trade_exit_option_window_ms = 60000
+
 [eod]
 symbols = ["SPY"]
 
 # Empty from_date means: start after the max date already present in local yearly EOD files.
-from_date = "20210101"
+from_date = "20160101"
 
 # Empty end_date means: previous business day.
 end_date = ""
@@ -25,7 +44,7 @@ symbols = ["SPY"]
 # Empty values mean:
 # - update/download: start after the max date already present in local M1 raw files
 # - enrich: use every date present in selected local option M1 parquet files
-from_date = ""
+from_date = "20160101"
 end_date = ""
 
 # Supported values: daily, weekly, monthly, yearly, all.
@@ -34,8 +53,8 @@ end_date = ""
 batch_mode = "weekly"
 
 # Allowed values: 1, 2, 4, 8. Pick the number available for your Theta subscription level.
-stock_concurrency = 2
-option_concurrency = 4
+stock_concurrency = 8
+option_concurrency = 8
 
 # Current SPY M1 raw files are 0DTE: option expiration equals quote date.
 # Supported values: same_day, all.

@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import polars as pl
 
-from ..loaders.tick import ensure_option_quote_windows, ensure_stock_tick_windows
+from ..loaders.tick import ensure_option_quote_windows, ensure_stock_quotes_windows, ensure_stock_trades_windows
 from ..settings import Settings
 from ..time_utils import ms_of_day
 
@@ -25,6 +25,34 @@ DEFAULT_OPTION_CONCURRENCY = 8
 DEFAULT_TICK_CONCURRENCY = 8
 DEFAULT_STOP_WINDOW_MS = 300_000
 DEFAULT_FALLBACK_EXIT_OPTION_PRICE = 0.02
+DEFAULT_STOCK_TICK_SOURCE = "quotes"
+DEFAULT_TRADE_EXIT_OPTION_WINDOW_MS = 60_000
+STOCK_TICK_SOURCES = {"quotes", "trades"}
+
+EQUITY_RTH_STOP_TRIGGER_STRICT = {
+    0,   # REGULAR
+    10,  # BUNCHED
+    14,  # RULE_127
+    22,  # ACQUISITION
+    25,  # BURST_BASKET
+    29,  # RULE_155
+    30,  # DISTRIBUTION
+    31,  # SPLIT
+    32,  # REGULAR_SETTLE
+    45,  # MATCH_CROSS
+    46,  # FAST_MARKET
+    55,  # STOPPED_REGULAR
+    75,  # BLOCK_TRADE
+    79,  # YELLOW_FLAG
+    95,  # INTERMARKET_SWEEP
+}
+
+TRADE_EXT_CONDITION_COLUMNS = [
+    "ext_condition1",
+    "ext_condition2",
+    "ext_condition3",
+    "ext_condition4",
+]
 
 
 DROP_OPTION_COLUMNS = [
@@ -65,6 +93,8 @@ class StrategyConfig:
     tick_concurrency: int = DEFAULT_TICK_CONCURRENCY
     stop_window_ms: int = DEFAULT_STOP_WINDOW_MS
     fallback_exit_option_price: float = DEFAULT_FALLBACK_EXIT_OPTION_PRICE
+    stock_tick_source: str = DEFAULT_STOCK_TICK_SOURCE
+    trade_exit_option_window_ms: int = DEFAULT_TRADE_EXIT_OPTION_WINDOW_MS
     output_path: Path | None = None
     random_seed: int | None = None
 
@@ -93,7 +123,7 @@ def run_strategy(
     dry_run: bool = False,
     write_output: bool = True,
 ) -> StrategyResult:
-    config = config or StrategyConfig()
+    config = normalize_strategy_config(config or StrategyConfig())
     if config.random_seed is not None:
         np.random.seed(config.random_seed)
 
@@ -143,6 +173,29 @@ def run_strategy(
     result.strangle_trades_rows = strangle_trades.height
     result.output_path = output_path if write_output else None
     return result
+
+
+def normalize_strategy_config(config: StrategyConfig) -> StrategyConfig:
+    stock_tick_source = normalize_stock_tick_source(config.stock_tick_source)
+    if stock_tick_source == config.stock_tick_source:
+        return config
+    return replace(config, stock_tick_source=stock_tick_source)
+
+
+def normalize_stock_tick_source(source: str) -> str:
+    normalized = str(source).strip().lower()
+    aliases = {
+        "quote": "quotes",
+        "stock_quote": "quotes",
+        "stock_quotes": "quotes",
+        "trade": "trades",
+        "stock_trade": "trades",
+        "stock_trades": "trades",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in STOCK_TICK_SOURCES:
+        raise ValueError(f"stock_tick_source must be one of {sorted(STOCK_TICK_SOURCES)}, got {source!r}")
+    return normalized
 
 
 def load_option_candidates(settings: Settings, config: StrategyConfig) -> pl.DataFrame:
@@ -394,8 +447,32 @@ def add_stock_tick_exit_times(
     stop_latency: pl.Series,
     config: StrategyConfig,
 ) -> pl.DataFrame:
+    if config.stock_tick_source == "trades":
+        return add_stock_trade_tick_exit_times(
+            settings=settings,
+            total_m1=total_m1,
+            right=right,
+            stop_latency=stop_latency,
+            config=config,
+        )
+    return add_stock_quote_tick_exit_times(
+        settings=settings,
+        total_m1=total_m1,
+        right=right,
+        stop_latency=stop_latency,
+        config=config,
+    )
+
+
+def add_stock_quote_tick_exit_times(
+    settings: Settings,
+    total_m1: pl.DataFrame,
+    right: str,
+    stop_latency: pl.Series,
+    config: StrategyConfig,
+) -> pl.DataFrame:
     tick_df = (
-        ensure_stock_tick_windows(
+        ensure_stock_quotes_windows(
             settings,
             total_m1,
             concurrency=config.tick_concurrency,
@@ -442,6 +519,91 @@ def add_stock_tick_exit_times(
         .with_columns(start_ms=pl.col("exact_stop_time_ms") + latency_distribution(stop_latency, total_m1.height))
         .with_columns(end_ms=pl.col("start_ms"))
     )
+
+
+def add_stock_trade_tick_exit_times(
+    settings: Settings,
+    total_m1: pl.DataFrame,
+    right: str,
+    stop_latency: pl.Series,
+    config: StrategyConfig,
+) -> pl.DataFrame:
+    tick_df = (
+        ensure_stock_trades_windows(
+            settings,
+            total_m1,
+            concurrency=config.tick_concurrency,
+        )
+        .rename({"time": "exact_stop_time"})
+    )
+    tick_df = filter_stock_trade_ticks(tick_df, load_trade_conditions(settings)).drop(
+        ["sequence", *TRADE_EXT_CONDITION_COLUMNS, "condition", "size", "exchange"]
+    )
+
+    if right == "call":
+        total_m1_with_ticks = total_m1.join(tick_df, on="date", how="left").filter(pl.col("price") > pl.col("strike"))
+    elif right == "put":
+        total_m1_with_ticks = total_m1.join(tick_df, on="date", how="left").filter(pl.col("price") < pl.col("strike"))
+    else:
+        raise ValueError(f"Wrong right: {right}")
+
+    total_m1_with_ticks = total_m1_with_ticks.sort("idx", "date", "exact_stop_time").unique(
+        "idx",
+        keep="first",
+        maintain_order=True,
+    )
+
+    missing_idx = set(total_m1["idx"]) - set(total_m1_with_ticks["idx"])
+    empty_data = total_m1.filter(pl.col("idx").is_in(missing_idx))
+
+    print(f"{empty_data.height} {right} - empty ticks")
+    empty_data = (
+        empty_data.join(tick_df, on="date", how="left")
+        .with_columns(diff=(pl.col("strike") - pl.col("price")).abs())
+        .sort("idx", "diff")
+        .unique("idx", keep="first", maintain_order=True)
+        .drop("diff")
+    )
+    total_m1 = (
+        pl.concat([total_m1_with_ticks, empty_data])
+        .sort("idx")
+        .drop(["price", "start_ms", "end_ms"])
+    )
+    return (
+        total_m1.with_columns(ms_of_day(total_m1["exact_stop_time"]).alias("exact_stop_time_ms"))
+        .with_columns(start_ms=pl.col("exact_stop_time_ms") + latency_distribution(stop_latency, total_m1.height))
+        .with_columns(end_ms=pl.col("start_ms") + config.trade_exit_option_window_ms)
+    )
+
+
+def filter_stock_trade_ticks(tick_df: pl.DataFrame, trade_conditions: set[int]) -> pl.DataFrame:
+    ext_allowed = trade_conditions | {255}
+    return tick_df.filter(
+        pl.col("condition").is_in(trade_conditions)
+        & pl.col("ext_condition1").is_in(ext_allowed)
+        & pl.col("ext_condition2").is_in(ext_allowed)
+        & pl.col("ext_condition3").is_in(ext_allowed)
+        & pl.col("ext_condition4").is_in(ext_allowed)
+    )
+
+
+def load_trade_conditions(settings: Settings) -> set[int]:
+    path = settings.project_root / "ThetaTerminal" / "TradeConditions.csv"
+    with path.open("r", encoding="utf-8") as handle:
+        header = handle.readline().strip().split(",")
+        rows = [line.strip().split(",", 10) for line in handle if line.strip()]
+    frame = pd.DataFrame(rows, columns=header)
+    code = frame["Code"].astype(int)
+    mask = (
+        frame["High"].str.lower().eq("true")
+        & frame["Low"].str.lower().eq("true")
+        & frame["Volume"].str.lower().eq("true")
+        & frame["Last"].str.lower().eq("true")
+        & frame["Cancel"].str.lower().eq("false")
+        & frame["LateReport"].str.lower().eq("false")
+        & code.isin(EQUITY_RTH_STOP_TRIGGER_STRICT)
+    )
+    return set(code[mask])
 
 
 def add_exit_option_prices(

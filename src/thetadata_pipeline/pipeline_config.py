@@ -50,11 +50,33 @@ class AnalysisConfig:
 
 
 @dataclass(frozen=True)
+class StrategyPipelineConfig:
+    ticker: str
+    date_cut: str | None
+    need_time: float
+    cut_delta_up: float
+    cut_delta_down: float
+    need_delta: float
+    account_id: str | None
+    latency_path: str | None
+    latency_max_seconds: float
+    option_concurrency: int
+    tick_concurrency: int
+    stop_window_ms: int
+    fallback_exit_option_price: float
+    stock_tick_source: str
+    trade_exit_option_window_ms: int
+    output: str | None
+    random_seed: int | None
+
+
+@dataclass(frozen=True)
 class PipelineConfig:
     eod: EodConfig
     m1: M1Config
     tick: TickConfig
     analysis: AnalysisConfig
+    strategy: StrategyPipelineConfig
 
 
 def load_pipeline_config(path: str | Path | None = None) -> PipelineConfig:
@@ -64,7 +86,8 @@ def load_pipeline_config(path: str | Path | None = None) -> PipelineConfig:
             eod=_default_eod_config(),
             m1=_default_m1_config(),
             tick=_default_tick_config(),
-            analysis=_default_analysis_config()
+            analysis=_default_analysis_config(),
+            strategy=_default_strategy_config(),
         )
 
     raw = tomllib.loads(config_path.read_text(encoding="utf-8"))
@@ -72,6 +95,7 @@ def load_pipeline_config(path: str | Path | None = None) -> PipelineConfig:
     m1_raw = raw.get("m1", {})
     tick_raw = raw.get("tick", {})
     analysis_raw = raw.get("analysis", {})
+    strategy_raw = raw.get("strategy", {})
     return PipelineConfig(
         eod=EodConfig(
             symbols=[str(symbol).upper() for symbol in eod_raw.get("symbols", ["SPY"])],
@@ -103,6 +127,25 @@ def load_pipeline_config(path: str | Path | None = None) -> PipelineConfig:
         ),
         analysis=AnalysisConfig(
             account_id=str(analysis_raw.get("account_id", "")),
+        ),
+        strategy=StrategyPipelineConfig(
+            ticker=str(strategy_raw.get("ticker", (m1_raw.get("symbols") or eod_raw.get("symbols") or ["SPY"])[0])).upper(),
+            date_cut=_empty_to_none(strategy_raw.get("date_cut")),
+            need_time=_float_or_default(strategy_raw.get("need_time"), 9.6),
+            cut_delta_up=_float_or_default(strategy_raw.get("cut_delta_up"), 0.40),
+            cut_delta_down=_float_or_default(strategy_raw.get("cut_delta_down"), 0.10),
+            need_delta=_float_or_default(strategy_raw.get("need_delta"), 0.35),
+            account_id=_empty_to_none(strategy_raw.get("account_id")),
+            latency_path=_empty_to_none(strategy_raw.get("latency_path")),
+            latency_max_seconds=_float_or_default(strategy_raw.get("latency_max_seconds"), 120.0),
+            option_concurrency=_int_or_default(strategy_raw.get("option_concurrency"), 8),
+            tick_concurrency=_int_or_default(strategy_raw.get("tick_concurrency"), 8),
+            stop_window_ms=_int_or_default(strategy_raw.get("stop_window_ms"), 300_000),
+            fallback_exit_option_price=_float_or_default(strategy_raw.get("fallback_exit_option_price"), 0.02),
+            stock_tick_source=str(strategy_raw.get("stock_tick_source", "quotes")),
+            trade_exit_option_window_ms=_int_or_default(strategy_raw.get("trade_exit_option_window_ms"), 60_000),
+            output=_empty_to_none(strategy_raw.get("output")),
+            random_seed=_optional_int(strategy_raw.get("random_seed")),
         ),
     )
 
@@ -150,6 +193,28 @@ def _default_analysis_config() -> AnalysisConfig:
     )
 
 
+def _default_strategy_config() -> StrategyPipelineConfig:
+    return StrategyPipelineConfig(
+        ticker="SPY",
+        date_cut="2021-01-01",
+        need_time=9.6,
+        cut_delta_up=0.40,
+        cut_delta_down=0.10,
+        need_delta=0.35,
+        account_id=None,
+        latency_path=None,
+        latency_max_seconds=120.0,
+        option_concurrency=8,
+        tick_concurrency=8,
+        stop_window_ms=300_000,
+        fallback_exit_option_price=0.02,
+        stock_tick_source="quotes",
+        trade_exit_option_window_ms=60_000,
+        output=None,
+        random_seed=None,
+    )
+
+
 def _empty_to_none(value: object) -> str | None:
     if value is None:
         return None
@@ -167,3 +232,13 @@ def _optional_float(value: object) -> float | None:
     if value is None or value == "":
         return None
     return float(value)
+
+
+def _int_or_default(value: object, default: int) -> int:
+    parsed = _optional_int(value)
+    return default if parsed is None else parsed
+
+
+def _float_or_default(value: object, default: float) -> float:
+    parsed = _optional_float(value)
+    return default if parsed is None else parsed

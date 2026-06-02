@@ -8,7 +8,7 @@ import pandas as pd
 import polars as pl
 
 from ..loaders.m1 import download_stock_m1_data
-from ..loaders.tick import ensure_stock_tick_windows
+from ..loaders.tick import ensure_stock_quotes_windows
 from ..settings import Settings
 from ..time_utils import format_time_ms, ms_of_day, parse_ib_expiration, time_to_ms_expr
 
@@ -263,7 +263,7 @@ def _resolve_tick_triggers(
     tick_concurrency = max(1, int(tick_concurrency))
     print(f"{ticker}. Tick trigger jobs={len(crossed)}, concurrency={tick_concurrency}")
 
-    tick_pool = ensure_stock_tick_windows(
+    tick_pool = ensure_stock_quotes_windows(
         settings=settings,
         windows=windows,
         concurrency=tick_concurrency,

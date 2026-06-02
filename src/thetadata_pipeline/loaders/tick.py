@@ -18,7 +18,7 @@ from ..time_utils import datetime_to_ms_expr, time_to_ms_expr
 
 
 @dataclass(frozen=True)
-class StockTickWindow:
+class StockWindow:
     ticker: str
     day: dt.date
     start_ms: int
@@ -53,7 +53,23 @@ OPTION_QUOTE_COLUMNS = [
     "ask_condition",
 ]
 
-def fetch_stock_quote_window(
+STOCK_QUOTES_COLUMNS = ["date", "time", "bid", "ask"]
+STOCK_TRADES_COLUMNS = [
+    "date",
+    "time",
+    "sequence",
+    "ext_condition1",
+    "ext_condition2",
+    "ext_condition3",
+    "ext_condition4",
+    "condition",
+    "size",
+    "exchange",
+    "price",
+]
+
+
+def fetch_stock_quotes_window(
     settings: Settings,
     symbol: str,
     day: dt.date,
@@ -69,7 +85,7 @@ def fetch_stock_quote_window(
     return _drop_empty_response_rows(frame)
 
 
-def fetch_stock_trade_window(
+def fetch_stock_trades_window(
     settings: Settings,
     symbol: str,
     day: dt.date,
@@ -109,12 +125,20 @@ def fetch_option_quote_window(
     return _drop_empty_response_rows(frame)
 
 
-def stock_tick_file_path(settings: Settings, ticker: str) -> Path:
-    return settings.stock_ticks_dir / f"{ticker.upper()}_ticks.parquet"
+def stock_quotes_file_path(settings: Settings, ticker: str) -> Path:
+    return settings.stock_ticks_quotes_dir / f"{ticker.upper()}_ticks.parquet"
 
 
-def stock_tick_coverage_path(settings: Settings, ticker: str) -> Path:
-    return settings.stock_ticks_dir / f"{ticker.upper()}_ticks_coverage.parquet"
+def stock_quotes_coverage_path(settings: Settings, ticker: str) -> Path:
+    return settings.stock_ticks_quotes_dir / f"{ticker.upper()}_ticks_coverage.parquet"
+
+
+def stock_trades_file_path(settings: Settings, ticker: str) -> Path:
+    return settings.stock_ticks_trades_dir / f"{ticker.upper()}_trades.parquet"
+
+
+def stock_trades_coverage_path(settings: Settings, ticker: str) -> Path:
+    return settings.stock_ticks_trades_dir / f"{ticker.upper()}_trades_coverage.parquet"
 
 
 def option_quote_file_path(settings: Settings, ticker: str, interval: str = "100ms") -> Path:
@@ -196,14 +220,15 @@ def ensure_option_quote_windows(
     if not normalized:
         return _empty_option_quote_frame()
 
+    requested = _merge_option_quote_windows(normalized)
     jobs: list[tuple[OptionQuoteWindow, int, int]] = []
-    for window in normalized:
+    for window in requested:
         missing = missing_option_quote_ranges(settings, window, interval=interval)
         jobs.extend((window, start, end) for start, end in missing)
 
-    tickers = sorted({window.ticker for window in normalized})
+    tickers = sorted({window.ticker for window in requested})
     print(
-        f"Option quotes {interval}: windows={len(normalized)}, "
+        f"Option quotes {interval}: windows={len(normalized)}, requested_ranges={len(requested)}, "
         f"theta_ranges={len(jobs)}, concurrency={max(1, int(option_concurrency))}, "
         f"tickers={','.join(tickers)}"
     )
@@ -291,7 +316,7 @@ def missing_option_quote_ranges(
         .sort("start_ms")
         .to_dicts()
     )
-    return _subtract_covered_ranges(window.start_ms, window.end_ms, [(row["start_ms"], row["end_ms"]) for row in rows])
+    return _coalesced_missing_ranges(window.start_ms, window.end_ms, [(row["start_ms"], row["end_ms"]) for row in rows])
 
 
 def _coerce_option_quote_windows(windows) -> list[OptionQuoteWindow]:
@@ -369,14 +394,14 @@ def _normalize_option_quote_window_values(
     )
 
 
-def load_stock_tick_window(
+def load_stock_quotes_window(
     settings: Settings,
     ticker: str,
     day: dt.date,
     start_ms: int,
     end_ms: int,
 ) -> pl.DataFrame | None:
-    path = stock_tick_file_path(settings, ticker)
+    path = stock_quotes_file_path(settings, ticker)
     if not path.exists():
         return None
 
@@ -384,8 +409,8 @@ def load_stock_tick_window(
     schema = lf.collect_schema()
     window = (
         lf.with_columns(
-            _stock_tick_date_expr(schema).alias("date"),
-            _stock_tick_ms_expr(schema).alias("ms_of_day"),
+            _stock_date_expr(schema).alias("date"),
+            _stock_ms_expr(schema).alias("ms_of_day"),
         )
         .filter(
             (pl.col("date") == day)
@@ -398,14 +423,43 @@ def load_stock_tick_window(
     return add_tick_time_columns(window).sort(["date", "time"])
 
 
-def missing_stock_tick_ranges(
+def load_stock_trades_window(
+    settings: Settings,
+    ticker: str,
+    day: dt.date,
+    start_ms: int,
+    end_ms: int,
+) -> pl.DataFrame:
+    path = stock_trades_file_path(settings, ticker)
+    if not path.exists():
+        return _empty_stock_trades_frame()
+
+    lf = pl.scan_parquet(path)
+    schema = lf.collect_schema()
+    return (
+        lf.with_columns(
+            _stock_date_expr(schema).alias("date"),
+            _stock_time_expr(schema).alias("time"),
+            _stock_ms_expr(schema).alias("ms_of_day"),
+        )
+        .filter(
+            (pl.col("date") == day)
+            & pl.col("ms_of_day").is_between(start_ms, end_ms, closed="both")
+        )
+        .select(STOCK_TRADES_COLUMNS)
+        .sort(["date", "time"])
+        .collect()
+    )
+
+
+def missing_stock_quotes_ranges(
     settings: Settings,
     ticker: str,
     day: dt.date,
     start_ms: int,
     end_ms: int,
 ) -> list[tuple[int, int]]:
-    coverage = _load_stock_tick_coverage(settings, ticker)
+    coverage = _load_stock_quotes_coverage(settings, ticker)
     if coverage.is_empty():
         return [(start_ms, end_ms)]
 
@@ -415,64 +469,157 @@ def missing_stock_tick_ranges(
         .sort("start_ms")
         .to_dicts()
     )
-    return _subtract_covered_ranges(start_ms, end_ms, [(row["start_ms"], row["end_ms"]) for row in rows])
+    return _coalesced_missing_ranges(start_ms, end_ms, [(row["start_ms"], row["end_ms"]) for row in rows])
 
 
-def ensure_stock_tick_window(
+def missing_stock_trades_ranges(
+    settings: Settings,
+    ticker: str,
+    day: dt.date,
+    start_ms: int,
+    end_ms: int,
+) -> list[tuple[int, int]]:
+    coverage = _load_stock_trades_coverage(settings, ticker)
+    if coverage.is_empty():
+        return [(start_ms, end_ms)]
+
+    rows = (
+        coverage.filter(pl.col("date") == day)
+        .select(["start_ms", "end_ms"])
+        .sort("start_ms")
+        .to_dicts()
+    )
+    return _coalesced_missing_ranges(start_ms, end_ms, [(row["start_ms"], row["end_ms"]) for row in rows])
+
+
+def ensure_stock_quotes_window(
     settings: Settings,
     ticker: str,
     day: dt.date,
     start_ms: int,
     end_ms: int,
     interval: str = "tick",
+    concurrency: int = 1,
 ) -> pl.DataFrame:
-    return ensure_stock_tick_windows(
+    return ensure_stock_quotes_windows(
         settings=settings,
-        windows=[StockTickWindow(ticker=ticker, day=day, start_ms=start_ms, end_ms=end_ms)],
-        concurrency=1,
+        windows=[StockWindow(ticker=ticker, day=day, start_ms=start_ms, end_ms=end_ms)],
+        concurrency=concurrency,
         interval=interval,
     )
 
 
-def ensure_stock_tick_windows(
+def ensure_stock_quotes_windows(
     settings: Settings,
     windows,
     concurrency: int = 1,
     interval: str = "tick",
+    day: dt.date | str | None = None,
+    date: dt.date | str | None = None,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
 ) -> pl.DataFrame:
     """Ensure stock tick data is available for the specified windows and return the combined data.
 
     Downloads missing stock quote ticks from Theta Data API and caches them locally.
     `windows` accepts the same input shapes as option quote windows: a single
-    StockTickWindow, an iterable of windows, a mapping, a Polars DataFrame, or
+    StockWindow, an iterable of windows, a mapping, a Polars DataFrame, or
     a pandas-like DataFrame with ticker/date/start_ms/end_ms columns.
     """
-    normalized = _coerce_stock_tick_windows(windows)
+    normalized = _coerce_stock_windows(
+        windows,
+        day=day if day is not None else date,
+        start_ms=start_ms,
+        end_ms=end_ms,
+    )
     if not normalized:
-        return _empty_stock_tick_frame()
+        return _empty_stock_quotes_frame()
 
-    requested = _merge_stock_tick_windows(normalized)
-    missing = _missing_stock_tick_windows(settings, requested)
-    print(f"Stock ticks. requested_ranges={len(requested)}, theta_ranges={len(missing)}")
+    requested = _merge_stock_windows(normalized)
+    missing = _missing_stock_quotes_windows(settings, requested)
+    print(f"Stock quote ticks. requested_ranges={len(requested)}, theta_ranges={len(missing)}")
     if missing:
-        _download_and_store_stock_tick_windows(
+        _download_and_store_stock_quotes_windows(
             settings=settings,
             windows=missing,
             concurrency=concurrency,
             interval=interval,
         )
-    return load_stock_tick_windows(settings, requested)
+    return load_stock_quotes_windows(settings, requested)
 
 
-def load_stock_tick_windows(settings: Settings, windows) -> pl.DataFrame:
-    windows = _coerce_stock_tick_windows(windows)
+def ensure_stock_trades_window(
+    settings: Settings,
+    ticker: str,
+    day: dt.date,
+    start_ms: int,
+    end_ms: int,
+    concurrency: int = 1,
+) -> pl.DataFrame:
+    return ensure_stock_trades_windows(
+        settings=settings,
+        windows=[StockWindow(ticker=ticker, day=day, start_ms=start_ms, end_ms=end_ms)],
+        concurrency=concurrency,
+    )
+
+
+def ensure_stock_trades_windows(
+    settings: Settings,
+    windows,
+    concurrency: int = 1,
+    day: dt.date | str | None = None,
+    date: dt.date | str | None = None,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+) -> pl.DataFrame:
+    """Ensure stock trade ticks are cached locally and return the requested rows.
+
+    `windows` accepts a string ticker with date/start_ms/end_ms keyword arguments,
+    a StockWindow, an iterable of windows, a mapping, a Polars DataFrame, or a
+    pandas-like DataFrame with ticker/date/start_ms/end_ms columns.
+    """
+    normalized = _coerce_stock_windows(
+        windows,
+        day=day if day is not None else date,
+        start_ms=start_ms,
+        end_ms=end_ms,
+    )
+    if not normalized:
+        return _empty_stock_trades_frame()
+
+    requested = _merge_stock_windows(normalized)
+    missing = _missing_stock_trades_windows(settings, requested)
+    print(f"Stock trade ticks. requested_ranges={len(requested)}, theta_ranges={len(missing)}")
+    if missing:
+        _download_and_store_stock_trades_windows(
+            settings=settings,
+            windows=missing,
+            concurrency=concurrency,
+        )
+    return load_stock_trades_windows(settings, requested)
+
+
+def load_stock_quotes_windows(
+    settings: Settings,
+    windows,
+    day: dt.date | str | None = None,
+    date: dt.date | str | None = None,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+) -> pl.DataFrame:
+    windows = _coerce_stock_windows(
+        windows,
+        day=day if day is not None else date,
+        start_ms=start_ms,
+        end_ms=end_ms,
+    )
     frames: list[pl.DataFrame] = []
     for window in windows:
-        ticks = load_stock_tick_window(settings, window.ticker, window.day, window.start_ms, window.end_ms)
+        ticks = load_stock_quotes_window(settings, window.ticker, window.day, window.start_ms, window.end_ms)
         if ticks is not None and not ticks.is_empty():
-            frames.append(ticks.select(["date", "time", "bid", "ask"]))
+            frames.append(ticks.select(STOCK_QUOTES_COLUMNS))
     if not frames:
-        return _empty_stock_tick_frame()
+        return _empty_stock_quotes_frame()
     return (
         pl.concat(frames)
         .sort(["date", "time"])
@@ -480,8 +627,45 @@ def load_stock_tick_windows(settings: Settings, windows) -> pl.DataFrame:
     )
 
 
-def _coerce_stock_tick_windows(windows) -> list[StockTickWindow]:
-    if isinstance(windows, StockTickWindow):
+def load_stock_trades_windows(
+    settings: Settings,
+    windows,
+    day: dt.date | str | None = None,
+    date: dt.date | str | None = None,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+) -> pl.DataFrame:
+    windows = _coerce_stock_windows(
+        windows,
+        day=day if day is not None else date,
+        start_ms=start_ms,
+        end_ms=end_ms,
+    )
+    frames: list[pl.DataFrame] = []
+    for window in windows:
+        trades = load_stock_trades_window(settings, window.ticker, window.day, window.start_ms, window.end_ms)
+        if not trades.is_empty():
+            frames.append(trades)
+    if not frames:
+        return _empty_stock_trades_frame()
+    return (
+        pl.concat(frames)
+        .sort(["date", "time"])
+        .unique(subset=["date", "time", "sequence", "price", "size", "exchange"], keep="first", maintain_order=True)
+    )
+
+
+def _coerce_stock_windows(
+    windows,
+    day: dt.date | str | None = None,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+) -> list[StockWindow]:
+    if isinstance(windows, str):
+        if day is None or start_ms is None or end_ms is None:
+            raise KeyError("String stock windows require date/day, start_ms, and end_ms keyword arguments")
+        raw_windows = [{"ticker": windows, "date": day, "start_ms": start_ms, "end_ms": end_ms}]
+    elif isinstance(windows, StockWindow):
         raw_windows = [windows]
     elif isinstance(windows, pl.DataFrame):
         raw_windows = windows.to_dicts()
@@ -492,28 +676,28 @@ def _coerce_stock_tick_windows(windows) -> list[StockTickWindow]:
     else:
         raw_windows = list(windows)
 
-    normalized: list[StockTickWindow] = []
+    normalized: list[StockWindow] = []
     for raw in raw_windows:
-        window = _normalize_stock_tick_window(raw)
+        window = _normalize_stock_window(raw)
         if window.start_ms <= window.end_ms:
             normalized.append(window)
     return normalized
 
 
-def _normalize_stock_tick_window(window) -> StockTickWindow:
-    if isinstance(window, StockTickWindow):
-        return _normalize_stock_tick_window_values(
+def _normalize_stock_window(window) -> StockWindow:
+    if isinstance(window, StockWindow):
+        return _normalize_stock_window_values(
             ticker=window.ticker,
             day=window.day,
             start_ms=window.start_ms,
             end_ms=window.end_ms,
         )
     if isinstance(window, dict):
-        return _stock_tick_window_from_mapping(window)
-    raise TypeError(f"Unsupported stock tick window row type: {type(window).__name__}")
+        return _stock_window_from_mapping(window)
+    raise TypeError(f"Unsupported stock window row type: {type(window).__name__}")
 
 
-def _stock_tick_window_from_mapping(row: dict) -> StockTickWindow:
+def _stock_window_from_mapping(row: dict) -> StockWindow:
     required = ["ticker", "date", "start_ms", "end_ms"]
     values = {
         "ticker": row.get("ticker"),
@@ -524,10 +708,10 @@ def _stock_tick_window_from_mapping(row: dict) -> StockTickWindow:
     missing = [column for column in required if values[column] is None]
     if missing:
         raise KeyError(
-            "Stock tick windows require fixed columns: "
+            "Stock windows require fixed columns: "
             f"{', '.join(required)}. Missing: {', '.join(missing)}"
         )
-    return _normalize_stock_tick_window_values(
+    return _normalize_stock_window_values(
         ticker=values["ticker"],
         day=values["date"],
         start_ms=values["start_ms"],
@@ -535,13 +719,13 @@ def _stock_tick_window_from_mapping(row: dict) -> StockTickWindow:
     )
 
 
-def _normalize_stock_tick_window_values(
+def _normalize_stock_window_values(
     ticker,
     day,
     start_ms,
     end_ms,
-) -> StockTickWindow:
-    return StockTickWindow(
+) -> StockWindow:
+    return StockWindow(
         ticker=str(ticker).upper(),
         day=coerce_date(day),
         start_ms=int(start_ms),
@@ -549,15 +733,15 @@ def _normalize_stock_tick_window_values(
     )
 
 
-def record_stock_tick_coverage(
+def record_stock_quotes_coverage(
     settings: Settings,
     ticker: str,
     ranges: list[tuple[dt.date, int, int]],
 ) -> Path:
-    path = stock_tick_coverage_path(settings, ticker)
+    path = stock_quotes_coverage_path(settings, ticker)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    rows = _load_stock_tick_coverage(settings, ticker).to_dicts()
+    rows = _load_stock_quotes_coverage(settings, ticker).to_dicts()
     rows.extend(
         {"date": day, "start_ms": int(start_ms), "end_ms": int(end_ms)}
         for day, start_ms, end_ms in ranges
@@ -577,17 +761,54 @@ def record_stock_tick_coverage(
     return path
 
 
-def stage_stock_tick_frame(settings: Settings, ticker: str, ticks: pl.DataFrame) -> Path:
-    ticker = ticker.upper()
-    staging_dir = settings.stock_ticks_dir / "_staging" / ticker
-    staging_dir.mkdir(parents=True, exist_ok=True)
-    path = staging_dir / f"{time.time_ns()}.parquet"
-    normalize_stock_tick_frame(ticks).write_parquet(path)
+def record_stock_trades_coverage(
+    settings: Settings,
+    ticker: str,
+    ranges: list[tuple[dt.date, int, int]],
+) -> Path:
+    path = stock_trades_coverage_path(settings, ticker)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    rows = _load_stock_trades_coverage(settings, ticker).to_dicts()
+    rows.extend(
+        {"date": day, "start_ms": int(start_ms), "end_ms": int(end_ms)}
+        for day, start_ms, end_ms in ranges
+        if start_ms <= end_ms
+    )
+    merged = _merge_coverage_rows(rows)
+    frame = pl.DataFrame(
+        merged,
+        schema={"date": pl.Date, "start_ms": pl.Int32, "end_ms": pl.Int32},
+        orient="row",
+    )
+    tmp_path = path.with_name(f"{path.stem}.tmp{path.suffix}")
+    if tmp_path.exists():
+        tmp_path.unlink()
+    frame.write_parquet(tmp_path)
+    tmp_path.replace(path)
     return path
 
 
-def merge_stock_tick_file(settings: Settings, ticker: str, staged_paths: list[Path]) -> Path:
-    output_path = stock_tick_file_path(settings, ticker)
+def stage_stock_quotes_frame(settings: Settings, ticker: str, ticks: pl.DataFrame) -> Path:
+    ticker = ticker.upper()
+    staging_dir = settings.stock_ticks_quotes_dir / "_staging" / ticker
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    path = staging_dir / f"{time.time_ns()}.parquet"
+    normalize_stock_quotes_frame(ticks).write_parquet(path)
+    return path
+
+
+def stage_stock_trades_frame(settings: Settings, ticker: str, trades: pl.DataFrame) -> Path:
+    ticker = ticker.upper()
+    staging_dir = settings.stock_ticks_trades_dir / "_staging" / ticker
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    path = staging_dir / f"{time.time_ns()}.parquet"
+    normalize_stock_trades_frame(trades).write_parquet(path)
+    return path
+
+
+def merge_stock_quotes_file(settings: Settings, ticker: str, staged_paths: list[Path]) -> Path:
+    output_path = stock_quotes_file_path(settings, ticker)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     inputs = ([output_path] if output_path.exists() else []) + [path for path in staged_paths if path.exists()]
     if not inputs:
@@ -597,7 +818,7 @@ def merge_stock_tick_file(settings: Settings, ticker: str, staged_paths: list[Pa
     if tmp_path.exists():
         tmp_path.unlink()
     (
-        pl.concat([_scan_compact_stock_tick_file(path) for path in inputs])
+        pl.concat([_scan_stock_quotes_file(path) for path in inputs])
         .sort(["date", "time"])
         .unique(subset=["date", "bid", "ask"], keep="first", maintain_order=True)
         .sink_parquet(tmp_path)
@@ -608,13 +829,44 @@ def merge_stock_tick_file(settings: Settings, ticker: str, staged_paths: list[Pa
     return output_path
 
 
-def append_stock_ticks(settings: Settings, ticker: str, ticks: pl.DataFrame) -> Path:
-    ticks = normalize_stock_tick_frame(ticks)
-    if ticks.is_empty():
-        return stock_tick_file_path(settings, ticker)
+def merge_stock_trades_file(settings: Settings, ticker: str, staged_paths: list[Path]) -> Path:
+    output_path = stock_trades_file_path(settings, ticker)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    inputs = ([output_path] if output_path.exists() else []) + [path for path in staged_paths if path.exists()]
+    if not inputs:
+        return output_path
 
-    staged_path = stage_stock_tick_frame(settings, ticker, ticks)
-    return merge_stock_tick_file(settings, ticker, [staged_path])
+    tmp_path = output_path.with_name(f"{output_path.stem}.tmp{output_path.suffix}")
+    if tmp_path.exists():
+        tmp_path.unlink()
+    (
+        pl.concat([_scan_stock_trades_file(path) for path in inputs])
+        .sort(["date", "time"])
+        .unique(subset=["date", "time", "sequence", "price", "size", "exchange"], keep="first", maintain_order=True)
+        .sink_parquet(tmp_path)
+    )
+    tmp_path.replace(output_path)
+    for path in staged_paths:
+        path.unlink(missing_ok=True)
+    return output_path
+
+
+def append_stock_quotes(settings: Settings, ticker: str, ticks: pl.DataFrame) -> Path:
+    ticks = normalize_stock_quotes_frame(ticks)
+    if ticks.is_empty():
+        return stock_quotes_file_path(settings, ticker)
+
+    staged_path = stage_stock_quotes_frame(settings, ticker, ticks)
+    return merge_stock_quotes_file(settings, ticker, [staged_path])
+
+
+def append_stock_trades(settings: Settings, ticker: str, trades: pl.DataFrame) -> Path:
+    trades = normalize_stock_trades_frame(trades)
+    if trades.is_empty():
+        return stock_trades_file_path(settings, ticker)
+
+    staged_path = stage_stock_trades_frame(settings, ticker, trades)
+    return merge_stock_trades_file(settings, ticker, [staged_path])
 
 
 def stage_option_quote_frame(
@@ -754,21 +1006,21 @@ def _download_and_store_option_quote_jobs(
         record_option_quote_coverage(settings, ticker, ranges, interval=interval)
 
 
-def _download_and_store_stock_tick_windows(
+def _download_and_store_stock_quotes_windows(
     settings: Settings,
-    windows: list[StockTickWindow],
+    windows: list[StockWindow],
     concurrency: int,
     interval: str,
 ) -> None:
     staged_by_ticker: dict[str, list[Path]] = {}
     covered_by_ticker: dict[str, list[tuple[dt.date, int, int]]] = {}
     concurrency = max(1, int(concurrency))
-    print(f"Stock ticks. Downloading theta_ranges={len(windows)}, concurrency={concurrency}, interval={interval}")
+    print(f"Stock quote ticks. Downloading theta_ranges={len(windows)}, concurrency={concurrency}, interval={interval}")
 
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = {
             executor.submit(
-                fetch_stock_quote_window,
+                fetch_stock_quotes_window,
                 settings,
                 window.ticker,
                 window.day,
@@ -778,13 +1030,13 @@ def _download_and_store_stock_tick_windows(
             ): window
             for window in windows
         }
-        with tqdm(total=len(futures), desc="Stock ticks download", unit="window") as pbar:
+        with tqdm(total=len(futures), desc="Stock quote ticks download", unit="window") as pbar:
             for future in as_completed(futures):
                 window = futures[future]
                 ticks = future.result()
                 if not ticks.is_empty():
                     staged_by_ticker.setdefault(window.ticker, []).append(
-                        stage_stock_tick_frame(settings, window.ticker, ticks)
+                        stage_stock_quotes_frame(settings, window.ticker, ticks)
                     )
                 covered_by_ticker.setdefault(window.ticker, []).append((window.day, window.start_ms, window.end_ms))
                 pbar.update(1)
@@ -795,40 +1047,119 @@ def _download_and_store_stock_tick_windows(
                 )
 
     for ticker, staged_paths in staged_by_ticker.items():
-        print(f"{ticker}. Tick cache merge: staged_files={len(staged_paths)}")
-        merge_stock_tick_file(settings, ticker, staged_paths)
+        print(f"{ticker}. Quote tick cache merge: staged_files={len(staged_paths)}")
+        merge_stock_quotes_file(settings, ticker, staged_paths)
     for ticker, ranges in covered_by_ticker.items():
-        print(f"{ticker}. Tick coverage update: ranges={len(ranges)}")
-        record_stock_tick_coverage(settings, ticker, ranges)
+        print(f"{ticker}. Quote tick coverage update: ranges={len(ranges)}")
+        record_stock_quotes_coverage(settings, ticker, ranges)
 
 
-def _missing_stock_tick_windows(settings: Settings, windows: list[StockTickWindow]) -> list[StockTickWindow]:
-    missing: list[StockTickWindow] = []
+def _download_and_store_stock_trades_windows(
+    settings: Settings,
+    windows: list[StockWindow],
+    concurrency: int,
+) -> None:
+    staged_by_ticker: dict[str, list[Path]] = {}
+    covered_by_ticker: dict[str, list[tuple[dt.date, int, int]]] = {}
+    concurrency = max(1, int(concurrency))
+    print(f"Stock trade ticks. Downloading theta_ranges={len(windows)}, concurrency={concurrency}")
+
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = {
+            executor.submit(
+                fetch_stock_trades_window,
+                settings,
+                window.ticker,
+                window.day,
+                window.start_ms,
+                window.end_ms,
+            ): window
+            for window in windows
+        }
+        with tqdm(total=len(futures), desc="Stock trade ticks download", unit="window") as pbar:
+            for future in as_completed(futures):
+                window = futures[future]
+                trades = future.result()
+                if not trades.is_empty():
+                    staged_by_ticker.setdefault(window.ticker, []).append(
+                        stage_stock_trades_frame(settings, window.ticker, trades)
+                    )
+                covered_by_ticker.setdefault(window.ticker, []).append((window.day, window.start_ms, window.end_ms))
+                pbar.update(1)
+                pbar.set_postfix(
+                    ticker=window.ticker,
+                    date=str(window.day),
+                    rows=trades.height,
+                )
+
+    for ticker, staged_paths in staged_by_ticker.items():
+        print(f"{ticker}. Trade tick cache merge: staged_files={len(staged_paths)}")
+        merge_stock_trades_file(settings, ticker, staged_paths)
+    for ticker, ranges in covered_by_ticker.items():
+        print(f"{ticker}. Trade tick coverage update: ranges={len(ranges)}")
+        record_stock_trades_coverage(settings, ticker, ranges)
+
+
+def _missing_stock_quotes_windows(settings: Settings, windows: list[StockWindow]) -> list[StockWindow]:
+    missing: list[StockWindow] = []
     for window in windows:
-        for start_ms, end_ms in missing_stock_tick_ranges(
+        for start_ms, end_ms in missing_stock_quotes_ranges(
             settings,
             window.ticker,
             window.day,
             window.start_ms,
             window.end_ms,
         ):
-            missing.append(StockTickWindow(window.ticker, window.day, start_ms, end_ms))
+            missing.append(StockWindow(window.ticker, window.day, start_ms, end_ms))
     return missing
 
 
-def _merge_stock_tick_windows(windows: list[StockTickWindow]) -> list[StockTickWindow]:
+def _missing_stock_trades_windows(settings: Settings, windows: list[StockWindow]) -> list[StockWindow]:
+    missing: list[StockWindow] = []
+    for window in windows:
+        for start_ms, end_ms in missing_stock_trades_ranges(
+            settings,
+            window.ticker,
+            window.day,
+            window.start_ms,
+            window.end_ms,
+        ):
+            missing.append(StockWindow(window.ticker, window.day, start_ms, end_ms))
+    return missing
+
+
+def _merge_stock_windows(windows: list[StockWindow]) -> list[StockWindow]:
     by_key: dict[tuple[str, dt.date], list[tuple[int, int]]] = {}
     for window in windows:
         by_key.setdefault((window.ticker.upper(), window.day), []).append((window.start_ms, window.end_ms))
 
-    merged: list[StockTickWindow] = []
+    merged: list[StockWindow] = []
     for (ticker, day), ranges in sorted(by_key.items()):
         for start_ms, end_ms in _merge_ms_ranges(ranges):
-            merged.append(StockTickWindow(ticker, day, start_ms, end_ms))
+            merged.append(StockWindow(ticker, day, start_ms, end_ms))
     return merged
 
 
-def normalize_stock_tick_frame(ticks: pl.DataFrame) -> pl.DataFrame:
+def _merge_option_quote_windows(windows: list[OptionQuoteWindow]) -> list[OptionQuoteWindow]:
+    by_key: dict[tuple[str, dt.date, dt.date, float, str], list[tuple[int, int]]] = {}
+    for window in windows:
+        key = (
+            window.ticker.upper(),
+            window.day,
+            window.expiration,
+            normalize_option_strike(window.strike),
+            _option_right_code(window.right),
+        )
+        by_key.setdefault(key, []).append((window.start_ms, window.end_ms))
+
+    merged: list[OptionQuoteWindow] = []
+    for (ticker, day, expiration, strike, right), ranges in sorted(by_key.items()):
+        for start_ms, end_ms in _merge_ms_ranges(ranges):
+            merged.append(OptionQuoteWindow(ticker, day, expiration, strike, right, start_ms, end_ms))
+    return merged
+
+
+def normalize_stock_quotes_frame(ticks: pl.DataFrame) -> pl.DataFrame:
     ticks = add_tick_time_columns(ticks)
     if ticks.is_empty():
         return ticks
@@ -843,6 +1174,32 @@ def normalize_stock_tick_frame(ticks: pl.DataFrame) -> pl.DataFrame:
         .select(["date", "time", "bid", "ask"])
         .sort(["date", "time"])
         .unique(subset=["date", "bid", "ask"], keep="first", maintain_order=True)
+    )
+
+
+def normalize_stock_trades_frame(trades: pl.DataFrame) -> pl.DataFrame:
+    if trades.is_empty():
+        return _empty_stock_trades_frame()
+
+    trades = add_tick_time_columns(trades)
+    columns = set(trades.columns)
+    return (
+        trades.with_columns(
+            pl.col("date").cast(pl.Date),
+            pl.col("time").cast(pl.Time),
+            _optional_col(columns, "sequence", pl.Int64),
+            _optional_col(columns, "ext_condition1", pl.Int16),
+            _optional_col(columns, "ext_condition2", pl.Int16),
+            _optional_col(columns, "ext_condition3", pl.Int16),
+            _optional_col(columns, "ext_condition4", pl.Int16),
+            _optional_col(columns, "condition", pl.Int16),
+            _optional_col(columns, "size", pl.Int64),
+            _optional_col(columns, "exchange", pl.Int16),
+            _optional_col(columns, "price", pl.Float64),
+        )
+        .select(STOCK_TRADES_COLUMNS)
+        .sort(["date", "time"])
+        .unique(subset=["date", "time", "sequence", "price", "size", "exchange"], keep="first", maintain_order=True)
     )
 
 
@@ -943,8 +1300,25 @@ def _drop_empty_response_rows(frame: pl.DataFrame) -> pl.DataFrame:
     return frame.drop_nulls("timestamp")
 
 
-def _load_stock_tick_coverage(settings: Settings, ticker: str) -> pl.DataFrame:
-    path = stock_tick_coverage_path(settings, ticker)
+def _load_stock_quotes_coverage(settings: Settings, ticker: str) -> pl.DataFrame:
+    path = stock_quotes_coverage_path(settings, ticker)
+    schema = {"date": pl.Date, "start_ms": pl.Int32, "end_ms": pl.Int32}
+    if not path.exists():
+        return pl.DataFrame(schema=schema)
+
+    return (
+        pl.read_parquet(path)
+        .with_columns(
+            pl.col("date").cast(pl.Date),
+            pl.col("start_ms").cast(pl.Int32),
+            pl.col("end_ms").cast(pl.Int32),
+        )
+        .select(["date", "start_ms", "end_ms"])
+    )
+
+
+def _load_stock_trades_coverage(settings: Settings, ticker: str) -> pl.DataFrame:
+    path = stock_trades_coverage_path(settings, ticker)
     schema = {"date": pl.Date, "start_ms": pl.Int32, "end_ms": pl.Int32}
     if not path.exists():
         return pl.DataFrame(schema=schema)
@@ -986,23 +1360,38 @@ def _load_option_quote_coverage(settings: Settings, ticker: str, interval: str =
     )
 
 
-def _subtract_covered_ranges(start_ms: int, end_ms: int, covered: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    missing: list[tuple[int, int]] = []
-    cursor = int(start_ms)
+def _coalesced_missing_ranges(start_ms: int, end_ms: int, covered: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    start_ms = int(start_ms)
     end_ms = int(end_ms)
-    for covered_start, covered_end in _merge_ms_ranges(covered):
-        if covered_end < cursor:
-            continue
-        if covered_start > end_ms:
+    if start_ms > end_ms:
+        return []
+
+    overlaps = [
+        (covered_start, covered_end)
+        for covered_start, covered_end in _merge_ms_ranges(covered)
+        if covered_end >= start_ms and covered_start <= end_ms
+    ]
+    if not overlaps:
+        return [(start_ms, end_ms)]
+
+    if any(covered_start <= start_ms and covered_end >= end_ms for covered_start, covered_end in overlaps):
+        return []
+
+    missing_start = start_ms
+    for covered_start, covered_end in overlaps:
+        if covered_start <= start_ms <= covered_end:
+            missing_start = covered_end
             break
-        if covered_start > cursor:
-            missing.append((cursor, min(covered_start - 1, end_ms)))
-        cursor = max(cursor, covered_end + 1)
-        if cursor > end_ms:
+
+    missing_end = end_ms
+    for covered_start, covered_end in reversed(overlaps):
+        if covered_start <= end_ms <= covered_end:
+            missing_end = covered_start
             break
-    if cursor <= end_ms:
-        missing.append((cursor, end_ms))
-    return missing
+
+    if missing_start <= missing_end:
+        return [(missing_start, missing_end)]
+    return []
 
 
 def _merge_coverage_rows(rows: list[dict]) -> list[dict]:
@@ -1070,7 +1459,7 @@ def _optional_col(columns: set[str], name: str, dtype: pl.DataType) -> pl.Expr:
     return (pl.col(name) if name in columns else pl.lit(None)).cast(dtype).alias(name)
 
 
-def _stock_tick_date_expr(schema) -> pl.Expr:
+def _stock_date_expr(schema) -> pl.Expr:
     has_timestamp = schema.get("timestamp") is not None
     timestamp = pl.col("timestamp").cast(pl.String).str.to_datetime(strict=False) if has_timestamp else None
     date_dtype = schema.get("date")
@@ -1109,7 +1498,7 @@ def _option_quote_date_expr(schema, column: str) -> pl.Expr:
     raise ValueError(f"Option quote parquet must contain {column} column")
 
 
-def _stock_tick_ms_expr(schema) -> pl.Expr:
+def _stock_ms_expr(schema) -> pl.Expr:
     if schema.get("ms_of_day") is not None:
         return pl.col("ms_of_day").cast(pl.Int32)
     if schema.get("time") is not None:
@@ -1131,7 +1520,7 @@ def _option_quote_ms_expr(schema) -> pl.Expr:
     raise ValueError("Option quote parquet must contain ms_of_day, time, or timestamp column")
 
 
-def _stock_tick_time_expr(schema) -> pl.Expr:
+def _stock_time_expr(schema) -> pl.Expr:
     if schema.get("time") is not None:
         return pl.col("time").cast(pl.Time)
     if schema.get("timestamp") is not None:
@@ -1151,19 +1540,43 @@ def _option_quote_right_expr() -> pl.Expr:
     return pl.col("right").cast(pl.String).str.to_uppercase().str.slice(0, 1)
 
 
-def _scan_compact_stock_tick_file(path: Path) -> pl.LazyFrame:
+def _scan_stock_quotes_file(path: Path) -> pl.LazyFrame:
     lf = pl.scan_parquet(path)
     schema = lf.collect_schema()
     return (
         lf.with_columns(
-            _stock_tick_date_expr(schema).alias("date"),
-            _stock_tick_time_expr(schema).alias("time"),
+            _stock_date_expr(schema).alias("date"),
+            _stock_time_expr(schema).alias("time"),
             pl.col("bid").cast(pl.Float64),
             pl.col("ask").cast(pl.Float64),
         )
         .select(["date", "time", "bid", "ask"])
         .sort(["date", "time"])
         .unique(subset=["date", "bid", "ask"], keep="first", maintain_order=True)
+    )
+
+
+def _scan_stock_trades_file(path: Path) -> pl.LazyFrame:
+    lf = pl.scan_parquet(path)
+    schema = lf.collect_schema()
+    columns = set(schema)
+    return (
+        lf.with_columns(
+            _stock_date_expr(schema).alias("date"),
+            _stock_time_expr(schema).alias("time"),
+            _optional_col(columns, "sequence", pl.Int64),
+            _optional_col(columns, "ext_condition1", pl.Int16),
+            _optional_col(columns, "ext_condition2", pl.Int16),
+            _optional_col(columns, "ext_condition3", pl.Int16),
+            _optional_col(columns, "ext_condition4", pl.Int16),
+            _optional_col(columns, "condition", pl.Int16),
+            _optional_col(columns, "size", pl.Int64),
+            _optional_col(columns, "exchange", pl.Int16),
+            _optional_col(columns, "price", pl.Float64),
+        )
+        .select(STOCK_TRADES_COLUMNS)
+        .sort(["date", "time"])
+        .unique(subset=["date", "time", "sequence", "price", "size", "exchange"], keep="first", maintain_order=True)
     )
 
 
@@ -1193,8 +1606,26 @@ def _scan_option_quote_file(path: Path) -> pl.LazyFrame:
     )
 
 
-def _empty_stock_tick_frame() -> pl.DataFrame:
+def _empty_stock_quotes_frame() -> pl.DataFrame:
     return pl.DataFrame(schema={"date": pl.Date, "time": pl.Time, "bid": pl.Float64, "ask": pl.Float64})
+
+
+def _empty_stock_trades_frame() -> pl.DataFrame:
+    return pl.DataFrame(
+        schema={
+            "date": pl.Date,
+            "time": pl.Time,
+            "sequence": pl.Int64,
+            "ext_condition1": pl.Int16,
+            "ext_condition2": pl.Int16,
+            "ext_condition3": pl.Int16,
+            "ext_condition4": pl.Int16,
+            "condition": pl.Int16,
+            "size": pl.Int64,
+            "exchange": pl.Int16,
+            "price": pl.Float64,
+        }
+    )
 
 
 def _empty_option_quote_frame() -> pl.DataFrame:

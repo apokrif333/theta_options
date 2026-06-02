@@ -13,10 +13,10 @@ from .loaders.m1 import (
     update_m1_data_with_greeks,
 )
 from .loaders.tick import (
-    append_stock_ticks,
+    ensure_stock_quotes_window,
+    ensure_stock_trades_window,
     ensure_option_quote_window,
-    fetch_stock_quote_window,
-    fetch_stock_trade_window,
+    fetch_stock_quotes_window,
 )
 from .pipeline_config import DEFAULT_CONFIG_PATH, load_pipeline_config
 from .rates import DGS1_HISTORY_START, ensure_local_dgs1_history
@@ -101,6 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
     tick_run_parser.add_argument("--start-ms", type=int, default=None)
     tick_run_parser.add_argument("--end-ms", type=int, default=None)
     tick_run_parser.add_argument("--interval", default=None)
+    tick_run_parser.add_argument("--stock-concurrency", type=int, choices=[1, 2, 4, 8], default=None)
     tick_run_parser.add_argument("--option-concurrency", type=int, choices=[1, 2, 4, 8], default=None)
     tick_run_parser.add_argument("--dry-run", action="store_true")
     tick_run_parser.set_defaults(func=_run_tick_config)
@@ -108,10 +109,12 @@ def build_parser() -> argparse.ArgumentParser:
     stock_quote_parser = tick_subparsers.add_parser("stock-quote", help="Download stock quote rows for a time window")
     _add_tick_window_arguments(stock_quote_parser)
     stock_quote_parser.add_argument("--interval", default="1s", help="Theta interval: tick, 10ms, 100ms, 1s, ...")
+    stock_quote_parser.add_argument("--stock-concurrency", type=int, choices=[1, 2, 4, 8], default=1)
     stock_quote_parser.set_defaults(func=_run_tick_stock_quote)
 
     stock_trade_parser = tick_subparsers.add_parser("stock-trade", help="Download stock trade rows for a time window")
     _add_tick_window_arguments(stock_trade_parser)
+    stock_trade_parser.add_argument("--stock-concurrency", type=int, choices=[1, 2, 4, 8], default=1)
     stock_trade_parser.set_defaults(func=_run_tick_stock_trade)
 
     option_quote_parser = tick_subparsers.add_parser("option-quote", help="Download option quote rows for a time window")
@@ -428,6 +431,7 @@ def _run_tick_config(args: argparse.Namespace) -> int:
         start_ms=args.start_ms,
         end_ms=args.end_ms,
         interval=args.interval,
+        stock_concurrency=args.stock_concurrency,
         option_concurrency=args.option_concurrency,
         dry_run=args.dry_run,
     )
@@ -449,30 +453,40 @@ def _run_lattency(args: argparse.Namespace) -> int:
 def _run_tick_stock_quote(args: argparse.Namespace) -> int:
     settings = get_settings()
     day = _required_date(args.date, "date")
-    frame = fetch_stock_quote_window(
-        settings=settings,
-        symbol=(args.symbol or settings.default_symbol).upper(),
-        day=day,
-        start_ms=args.start_ms,
-        end_ms=args.end_ms,
-        interval=args.interval,
-    )
-    _print_tick_frame(frame, "stock_quote")
+    symbol = (args.symbol or settings.default_symbol).upper()
     if args.interval.lower() == "tick":
-        output_path = append_stock_ticks(settings, (args.symbol or settings.default_symbol).upper(), frame)
-        print(f"stock_tick_output_path={output_path}")
+        frame = ensure_stock_quotes_window(
+            settings=settings,
+            ticker=symbol,
+            day=day,
+            start_ms=args.start_ms,
+            end_ms=args.end_ms,
+            interval=args.interval,
+            concurrency=args.stock_concurrency,
+        )
+    else:
+        frame = fetch_stock_quotes_window(
+            settings=settings,
+            symbol=symbol,
+            day=day,
+            start_ms=args.start_ms,
+            end_ms=args.end_ms,
+            interval=args.interval,
+        )
+    _print_tick_frame(frame, "stock_quote")
     return 0
 
 
 def _run_tick_stock_trade(args: argparse.Namespace) -> int:
     settings = get_settings()
     day = _required_date(args.date, "date")
-    frame = fetch_stock_trade_window(
+    frame = ensure_stock_trades_window(
         settings=settings,
-        symbol=(args.symbol or settings.default_symbol).upper(),
+        ticker=(args.symbol or settings.default_symbol).upper(),
         day=day,
         start_ms=args.start_ms,
         end_ms=args.end_ms,
+        concurrency=args.stock_concurrency,
     )
     _print_tick_frame(frame, "stock_trade")
     return 0

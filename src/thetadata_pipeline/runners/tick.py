@@ -11,10 +11,10 @@ if str(SRC_DIR) not in sys.path:
 
 from thetadata_pipeline.dates import parse_date
 from thetadata_pipeline.loaders.tick import (
-    append_stock_ticks,
+    ensure_stock_quotes_window,
+    ensure_stock_trades_window,
     ensure_option_quote_window,
-    fetch_stock_quote_window,
-    fetch_stock_trade_window,
+    fetch_stock_quotes_window,
 )
 from thetadata_pipeline.pipeline_config import load_pipeline_config
 from thetadata_pipeline.settings import get_settings
@@ -26,6 +26,7 @@ def run(
     start_ms: int | None = None,
     end_ms: int | None = None,
     interval: str | None = None,
+    stock_concurrency: int | None = None,
     option_concurrency: int | None = None,
     dry_run: bool = False,
 ) -> int:
@@ -38,6 +39,7 @@ def run(
     effective_start_ms = start_ms if start_ms is not None else tick.start_ms
     effective_end_ms = end_ms if end_ms is not None else tick.end_ms
     effective_interval = interval or tick.interval
+    effective_stock_concurrency = stock_concurrency or cfg.m1.stock_concurrency
     effective_option_concurrency = option_concurrency or cfg.m1.option_concurrency
 
     for symbol in tick.symbols or [settings.default_symbol]:
@@ -49,6 +51,7 @@ def run(
                 start_ms=effective_start_ms,
                 end_ms=effective_end_ms,
                 interval=effective_interval,
+                stock_concurrency=effective_stock_concurrency,
                 option_concurrency=effective_option_concurrency,
                 expiration=tick.expiration,
                 strike=tick.strike,
@@ -57,27 +60,36 @@ def run(
             continue
 
         if effective_mode == "stock_quote":
-            frame = fetch_stock_quote_window(
-                settings=settings,
-                symbol=symbol,
-                day=effective_date,
-                start_ms=effective_start_ms,
-                end_ms=effective_end_ms,
-                interval=effective_interval,
-            )
-            _print_frame(frame, symbol, effective_mode)
             if effective_interval.lower() == "tick":
-                output_path = append_stock_ticks(settings, symbol, frame)
-                print(f"stock_tick_output_path={output_path}")
+                frame = ensure_stock_quotes_window(
+                    settings=settings,
+                    ticker=symbol,
+                    day=effective_date,
+                    start_ms=effective_start_ms,
+                    end_ms=effective_end_ms,
+                    interval=effective_interval,
+                    concurrency=effective_stock_concurrency,
+                )
+            else:
+                frame = fetch_stock_quotes_window(
+                    settings=settings,
+                    symbol=symbol,
+                    day=effective_date,
+                    start_ms=effective_start_ms,
+                    end_ms=effective_end_ms,
+                    interval=effective_interval,
+                )
+            _print_frame(frame, symbol, effective_mode)
             continue
 
         if effective_mode == "stock_trade":
-            frame = fetch_stock_trade_window(
+            frame = ensure_stock_trades_window(
                 settings=settings,
-                symbol=symbol,
+                ticker=symbol,
                 day=effective_date,
                 start_ms=effective_start_ms,
                 end_ms=effective_end_ms,
+                concurrency=effective_stock_concurrency,
             )
             _print_frame(frame, symbol, effective_mode)
             continue
@@ -113,6 +125,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-ms", type=int, default=None)
     parser.add_argument("--end-ms", type=int, default=None)
     parser.add_argument("--interval", default=None)
+    parser.add_argument("--stock-concurrency", type=int, choices=[1, 2, 4, 8], default=None)
     parser.add_argument("--option-concurrency", type=int, choices=[1, 2, 4, 8], default=None)
     parser.add_argument("--dry-run", action="store_true")
     return parser
@@ -142,6 +155,7 @@ def _print_plan(
     start_ms: int,
     end_ms: int,
     interval: str,
+    stock_concurrency: int,
     option_concurrency: int,
     expiration: str | None,
     strike: float | None,
@@ -154,6 +168,7 @@ def _print_plan(
     print(f"start_ms={start_ms}")
     print(f"end_ms={end_ms}")
     print(f"interval={interval}")
+    print(f"stock_concurrency={stock_concurrency}")
     print(f"option_concurrency={option_concurrency}")
     if mode == "option_quote":
         print(f"expiration={expiration}")
@@ -170,6 +185,7 @@ if __name__ == "__main__":
             start_ms=args.start_ms,
             end_ms=args.end_ms,
             interval=args.interval,
+            stock_concurrency=args.stock_concurrency,
             option_concurrency=args.option_concurrency,
             dry_run=args.dry_run,
         )
